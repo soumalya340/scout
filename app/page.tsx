@@ -21,7 +21,10 @@ import {
 import axios from "axios";
 import Navbar from "@/components/Navbar";
 
-const ACCESS_CODE = "FOMOFAM123";
+const ACCESS_CODE = process.env.NEXT_PUBLIC_SCOUT_ACCESS_CODE;
+if (!ACCESS_CODE) {
+  throw new Error("NEXT_PUBLIC_SCOUT_ACCESS_CODE is not configured in .env");
+}
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL ?? ""}/api`;
 
@@ -111,6 +114,7 @@ export default function ScoutPage() {
   const [newOpportunityUrl, setNewOpportunityUrl] = useState('');
   const [opportunityGoal, setOpportunityGoal] = useState('');
   const [elevatedQuery, setElevatedQuery] = useState('');
+  const [opportunityKeywords, setOpportunityKeywords] = useState<string[]>([]);
   const [opportunityResults, setOpportunityResults] = useState<ResultsMap>({});
   const [opportunityScraping, setOpportunityScraping] = useState(false);
   const [opportunityError, setOpportunityError] = useState("");
@@ -197,10 +201,9 @@ export default function ScoutPage() {
       try {
         const parsed: unknown = JSON.parse(data);
         if (Array.isArray(parsed)) return parsed as ScrapedRow[];
-        if (parsed && typeof parsed === "object") {
-          const o = parsed as Record<string, unknown>;
-          const a = o.events ?? o.opportunities ?? o.results;
-          return Array.isArray(a) ? (a as ScrapedRow[]) : [];
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          // Re-use the object branch by recursing
+          return parseResults(parsed);
         }
         return [];
       } catch {
@@ -209,8 +212,33 @@ export default function ScoutPage() {
     }
     if (typeof data === "object" && data !== null) {
       const o = data as Record<string, unknown>;
-      const a = o.events ?? o.opportunities ?? o.results;
-      return Array.isArray(a) ? (a as ScrapedRow[]) : [];
+      // Try known flat array keys first
+      const knownKeys = ["events", "opportunities", "results", "jobs", "job_listings", "top_picks", "listings", "data"];
+      for (const key of knownKeys) {
+        if (Array.isArray(o[key])) return o[key] as ScrapedRow[];
+      }
+      // Try nested: categories[].jobs (e.g. { categories: [{ jobs: [...] }] })
+      for (const val of Object.values(o)) {
+        if (Array.isArray(val)) {
+          const flat = val.flatMap((item) => {
+            if (item && typeof item === "object") {
+              const inner = item as Record<string, unknown>;
+              for (const k of ["jobs", "events", "opportunities", "results", "listings"]) {
+                if (Array.isArray(inner[k])) return inner[k] as ScrapedRow[];
+              }
+            }
+            return [item as ScrapedRow];
+          });
+          if (flat.length > 0) return flat;
+        }
+        // One level deeper: { someKey: { jobs: [...] } }
+        if (val && typeof val === "object" && !Array.isArray(val)) {
+          const inner = val as Record<string, unknown>;
+          for (const key of knownKeys) {
+            if (Array.isArray(inner[key])) return inner[key] as ScrapedRow[];
+          }
+        }
+      }
     }
     return [];
   };
@@ -246,16 +274,20 @@ export default function ScoutPage() {
     setOpportunityScraping(true);
     setOpportunityError("");
     setElevatedQuery("");
+    setOpportunityKeywords([]);
     setOppServerDurationMs(null);
     try {
       // Step 1: Elevate the vague prompt via OpenRouter + discover sources via Brave/DDG
       const elevateRes = await axios.post<{
         elevatedQuery?: string;
+        keywords?: string[];
         urls?: { url: string; name?: string }[];
       }>("/api/elevate-prompt", { goal: opportunityGoal.trim(), count: 5 });
 
       const elevated = elevateRes.data.elevatedQuery || opportunityGoal.trim();
+      const keywords = elevateRes.data.keywords ?? [];
       setElevatedQuery(elevated);
+      setOpportunityKeywords(keywords);
 
       // Merge discovered URLs with default sources (dedupe by hostname)
       const discoveredUrls = elevateRes.data.urls ?? [];
@@ -276,14 +308,18 @@ export default function ScoutPage() {
       const allSources = [...opportunitySources, ...newSources];
       setOpportunitySources(allSources);
 
-      // Step 2: Scrape all sources with the elevated goal
+      // Step 2: Build a strict scrape goal that enforces keywords
+      const scrapeGoal = keywords.length > 0
+        ? `Find opportunities strictly related to: ${keywords.join(", ")}. ONLY return results that directly match these keywords. Ignore unrelated listings. Return as JSON array with fields: title, company, location, salary, description.`
+        : `${elevated}. Return as JSON array with fields: title, company, location, salary, description.`;
+
       const res = await axios.post<{
         results?: ResultsMap;
         durationMs?: number;
         error?: string;
       }>("/api/scout/run-scrape", {
         urls: allSources.map((s) => s.url),
-        goal: elevated,
+        goal: scrapeGoal,
       });
       if (res.data.results) setOpportunityResults(res.data.results);
       if (typeof res.data.durationMs === "number") setOppServerDurationMs(res.data.durationMs);
@@ -686,7 +722,18 @@ export default function ScoutPage() {
                         <Zap size={10} className="text-emerald-400" />
                         AI-elevated search query
                       </p>
-                      <p className="text-emerald-300 text-xs font-mono">{elevatedQuery}</p>
+                      <p className="text-emerald-300 text-xs font-mono mb-2">{elevatedQuery}</p>
+                      {opportunityKeywords.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className="text-white/30 text-[10px] uppercase tracking-wider mr-1 self-center">Keywords:</span>
+                          {opportunityKeywords.map((kw) => (
+                            <span key={kw} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">
+                              <Target size={8} />
+                              {kw}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -778,39 +825,69 @@ export default function ScoutPage() {
                 </div>
 
                 {/* Results */}
-                {Object.keys(opportunityResults).length > 0 && (
-                  <div className="lg:col-span-2 glass-card p-6 border border-emerald-500/20">
-                    <h3 className="font-display font-bold text-white mb-4 flex items-center gap-2">
+                {Object.keys(opportunityResults).length > 0 && (() => {
+                  // Flatten all opps, then filter by keywords
+                  const allOpps = Object.entries(opportunityResults).flatMap(([source, data]) =>
+                    parseResults(data).map((opp, i) => ({ ...opp, _source: source, _idx: i }))
+                  );
+
+                  const matchesKeywords = (opp: ScrapedRow): boolean => {
+                    if (opportunityKeywords.length === 0) return true;
+                    // Combine all text fields into one blob for matching
+                    const blob = [
+                      pickStr(opp, ["title", "name", "position", "role"]),
+                      pickStr(opp, ["company"]),
+                      pickStr(opp, ["description", "summary", "details", "suitability", "focus", "why_good_fit"]),
+                      pickStr(opp, ["location"]),
+                      // Also check array fields like skills, requirements
+                      ...Object.values(opp).filter((v): v is string[] => Array.isArray(v)).flat(),
+                    ].join(" ").toLowerCase();
+                    // Require at least one keyword to match
+                    return opportunityKeywords.some((kw) => blob.includes(kw.toLowerCase()));
+                  };
+
+                  const filtered = allOpps.filter(matchesKeywords);
+
+                  return (
+                  <div className="lg:col-span-2 glass-card p-6 border border-emerald-500/20 max-h-[70vh] flex flex-col">
+                    <h3 className="font-display font-bold text-white mb-4 flex items-center gap-2 shrink-0">
                       <Briefcase size={18} className="text-emerald-400" />
                       Found Opportunities
+                      <span className="text-white/30 text-sm font-normal ml-1">({filtered.length})</span>
                     </h3>
+                    <div className="overflow-y-auto flex-1 pr-2">
                     <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                      {Object.entries(opportunityResults).map(([source, data]) => {
-                        const opps = parseResults(data);
-                        return opps.slice(0, 6).map((opp, i) => (
-                          <div key={`${source}-${i}`} className="glass p-4 rounded-xl hover:bg-white/5 transition-all" data-testid={`opp-result-${source}-${i}`}>
-                            <h4 className="font-semibold text-white text-sm mb-1 truncate">
-                              {pickStr(opp, ["title", "name"]) || "Opportunity"}
+                      {filtered.map((opp, i) => (
+                          <div key={`${opp._source}-${opp._idx}-${i}`} className="glass p-4 rounded-xl hover:bg-white/5 transition-all" data-testid={`opp-result-${opp._source}-${opp._idx}`}>
+                            <h4 className="font-semibold text-white text-sm mb-1 line-clamp-2">
+                              {pickStr(opp, ["title", "name", "position", "role"]) || "Opportunity"}
                             </h4>
+                            {pickStr(opp, ["company"]) && (
+                              <p className="text-emerald-400 text-xs font-medium mb-1">{pickStr(opp, ["company"])}</p>
+                            )}
                             <p className="text-white/40 text-xs mb-2 line-clamp-2">
-                              {pickStr(opp, ["description", "summary"]) || "No description"}
+                              {pickStr(opp, ["description", "summary", "details", "suitability", "focus", "why_good_fit"]) || ""}
                             </p>
-                            <div className="flex items-center gap-2 text-xs">
-                              {pickStr(opp, ["company"]) && (
-                                <span className="text-white/30">{pickStr(opp, ["company"])}</span>
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              {pickStr(opp, ["location"]) && (
+                                <span className="flex items-center gap-1 text-white/30">
+                                  <MapPin size={9} />
+                                  {pickStr(opp, ["location"])}
+                                </span>
                               )}
-                              {(pickStr(opp, ["prize"]) || pickStr(opp, ["salary"])) && (
-                                <span className="text-emerald-400">
-                                  {pickStr(opp, ["prize"]) || pickStr(opp, ["salary"])}
+                              {pickStr(opp, ["salary", "compensation", "prize"]) && (
+                                <span className="text-emerald-400 font-mono">
+                                  {pickStr(opp, ["salary", "compensation", "prize"])}
                                 </span>
                               )}
                             </div>
                           </div>
-                        ));
-                      })}
+                        ))}
+                    </div>
                     </div>
                   </div>
-                )}
+                  );
+                })()}
               </motion.div>
             )}
           </AnimatePresence>
