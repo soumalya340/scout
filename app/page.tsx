@@ -15,7 +15,6 @@ import {
   Globe,
   Search,
   Zap,
-  Loader2,
   Lock,
   Timer,
 } from "lucide-react";
@@ -23,7 +22,6 @@ import axios from "axios";
 import Navbar from "@/components/Navbar";
 
 const ACCESS_CODE = "FOMOFAM123";
-const SCOUT_ACCESS_KEY = "fomofam_scout_access";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL ?? ""}/api`;
 
@@ -88,17 +86,10 @@ export default function ScoutPage() {
   const [accessCode, setAccessCode] = useState("");
   const [accessError, setAccessError] = useState("");
 
-  useEffect(() => {
-    try {
-      setHasAccess(sessionStorage.getItem(SCOUT_ACCESS_KEY) === "true");
-    } catch {
-      /* ignore */
-    }
-  }, []);
+  // No persistence — access resets on every page load/refresh
 
   const handleAccessSubmit = () => {
     if (accessCode.trim() === ACCESS_CODE) {
-      sessionStorage.setItem(SCOUT_ACCESS_KEY, 'true');
       setHasAccess(true);
       setAccessError('');
     } else {
@@ -118,9 +109,8 @@ export default function ScoutPage() {
   // Opportunity Hunter state
   const [opportunitySources, setOpportunitySources] = useState<Source[]>(DEFAULT_OPPORTUNITY_SOURCES);
   const [newOpportunityUrl, setNewOpportunityUrl] = useState('');
-  const [opportunitySearchQuery, setOpportunitySearchQuery] = useState('');
-  const [opportunitySearching, setOpportunitySearching] = useState(false);
   const [opportunityGoal, setOpportunityGoal] = useState('');
+  const [elevatedQuery, setElevatedQuery] = useState('');
   const [opportunityResults, setOpportunityResults] = useState<ResultsMap>({});
   const [opportunityScraping, setOpportunityScraping] = useState(false);
   const [opportunityError, setOpportunityError] = useState("");
@@ -191,53 +181,6 @@ export default function ScoutPage() {
     setSources(sources.filter((s) => s.url !== url));
   };
 
-  const searchWeb = async (
-    query: string,
-    sources: Source[],
-    setSources: Dispatch<SetStateAction<Source[]>>,
-    setSearching: Dispatch<SetStateAction<boolean>>,
-    setError: Dispatch<SetStateAction<string>>
-  ) => {
-    if (!query.trim()) return;
-    setSearching(true);
-    setError("");
-    try {
-      const res = await axios.post<{ urls?: { url: string; name?: string }[] }>(
-        "/api/search-urls",
-        { query, count: 5 }
-      );
-      const newUrls: { url: string; name?: string }[] = res.data.urls ?? [];
-      const existingUrls = new Set(sources.map((s) => s.url));
-      const discovered: Source[] = newUrls
-        .filter((u) => !existingUrls.has(u.url))
-        .map((u) => {
-          let name = u.name;
-          if (!name) {
-            try {
-              name = new URL(u.url).hostname;
-            } catch {
-              name = u.url;
-            }
-          }
-          return {
-            url: u.url,
-            name,
-            isDefault: false,
-            discovered: true,
-          };
-        });
-      if (discovered.length > 0) {
-        setSources((prev) => [...prev, ...discovered]);
-      } else {
-        setError("No new sources found. Try a different search query.");
-      }
-    } catch {
-      setError("Search failed. Try again.");
-    } finally {
-      setSearching(false);
-    }
-  };
-
   const parseResults = (data: unknown): ScrapedRow[] => {
     if (!data) return [];
     if (typeof data === "object" && data !== null && "error" in data) {
@@ -302,20 +245,50 @@ export default function ScoutPage() {
     }
     setOpportunityScraping(true);
     setOpportunityError("");
+    setElevatedQuery("");
     setOppServerDurationMs(null);
     try {
+      // Step 1: Elevate the vague prompt via OpenRouter + discover sources via Brave/DDG
+      const elevateRes = await axios.post<{
+        elevatedQuery?: string;
+        urls?: { url: string; name?: string }[];
+      }>("/api/elevate-prompt", { goal: opportunityGoal.trim(), count: 5 });
+
+      const elevated = elevateRes.data.elevatedQuery || opportunityGoal.trim();
+      setElevatedQuery(elevated);
+
+      // Merge discovered URLs with default sources (dedupe by hostname)
+      const discoveredUrls = elevateRes.data.urls ?? [];
+      const existingHosts = new Set(
+        opportunitySources.map((s) => { try { return new URL(s.url).hostname; } catch { return s.url; } })
+      );
+      const newSources: Source[] = discoveredUrls
+        .filter((u) => {
+          try { return !existingHosts.has(new URL(u.url).hostname); } catch { return false; }
+        })
+        .map((u) => ({
+          url: u.url,
+          name: u.name || u.url,
+          isDefault: false,
+          discovered: true,
+        }));
+
+      const allSources = [...opportunitySources, ...newSources];
+      setOpportunitySources(allSources);
+
+      // Step 2: Scrape all sources with the elevated goal
       const res = await axios.post<{
         results?: ResultsMap;
         durationMs?: number;
         error?: string;
       }>("/api/scout/run-scrape", {
-        urls: opportunitySources.map((s) => s.url),
-        goal: opportunityGoal.trim(),
+        urls: allSources.map((s) => s.url),
+        goal: elevated,
       });
       if (res.data.results) setOpportunityResults(res.data.results);
       if (typeof res.data.durationMs === "number") setOppServerDurationMs(res.data.durationMs);
     } catch (err: unknown) {
-      setOpportunityError(axiosDetail(err) || "Failed to run opportunity scrape (check TINYFISH_API_KEY)");
+      setOpportunityError(axiosDetail(err) || "Failed to run opportunity scrape");
     } finally {
       setOpportunityScraping(false);
     }
@@ -707,52 +680,40 @@ export default function ScoutPage() {
                     data-testid="opportunity-goal-input"
                   />
 
-                  <p className="text-white/40 text-xs mb-2">Search Sources:</p>
-                  <div className="space-y-2 max-h-36 overflow-y-auto mb-3">
-                    {opportunitySources.map((source) => (
-                      <div key={source.url} className="flex items-center gap-3 p-2 glass rounded-lg group">
-                        <Zap size={12} className={`flex-shrink-0 ${source.discovered ? 'text-cyan-400' : 'text-emerald-400'}`} />
-                        <span className="text-white/70 text-xs truncate flex-1">
-                          {source.name}
-                          {source.discovered && <span className="text-cyan-400 ml-1">discovered</span>}
-                        </span>
-                        {!source.isDefault && (
-                          <button onClick={() => removeSource(opportunitySources, setOpportunitySources, source.url)} className="opacity-0 group-hover:opacity-100" data-testid={`remove-opp-source-${source.name}`}>
-                            <X size={12} className="text-white/40" />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* search_index: DDG + Brave (server /api/search-urls) */}
-                  <div className="mb-3">
-                    <p className="text-white/50 text-xs mb-1.5 flex items-center gap-1">
-                      <Search size={10} />
-                      Discover sources (DuckDuckGo + Brave)
-                    </p>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        placeholder="e.g. web3 developer jobs 2026..."
-                        value={opportunitySearchQuery}
-                        onChange={(e) => setOpportunitySearchQuery(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && searchWeb(opportunitySearchQuery, opportunitySources, setOpportunitySources, setOpportunitySearching, setOpportunityError)}
-                        className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white text-sm placeholder-white/25 focus:outline-none focus:border-emerald-500/50"
-                        data-testid="opportunity-search-query-input"
-                      />
-                      <button
-                        onClick={() => searchWeb(opportunitySearchQuery, opportunitySources, setOpportunitySources, setOpportunitySearching, setOpportunityError)}
-                        disabled={opportunitySearching || !opportunitySearchQuery.trim()}
-                        className="btn-glass px-3 disabled:opacity-50"
-                        data-testid="opportunity-search-btn"
-                      >
-                        {opportunitySearching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
-                      </button>
+                  {elevatedQuery && (
+                    <div className="glass rounded-xl p-3 mb-4 border border-emerald-500/15">
+                      <p className="text-white/40 text-[10px] uppercase tracking-wider mb-1 flex items-center gap-1">
+                        <Zap size={10} className="text-emerald-400" />
+                        AI-elevated search query
+                      </p>
+                      <p className="text-emerald-300 text-xs font-mono">{elevatedQuery}</p>
                     </div>
-                  </div>
+                  )}
 
-                  {/* Manual URL add */}
+                  {opportunitySources.length > 0 && (
+                    <div className="mb-3">
+                      <p className="text-white/30 text-[10px] uppercase tracking-wider mb-2">
+                        {opportunitySources.some((s) => s.discovered) ? 'Discovered sources' : 'Default sources'} ({opportunitySources.length})
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {opportunitySources.map((source) => (
+                          <span
+                            key={source.url}
+                            className={`inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-md ${
+                              source.discovered
+                                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
+                                : 'bg-white/5 text-white/40 border border-white/10'
+                            }`}
+                          >
+                            <Globe size={8} />
+                            {source.name}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Custom URL add */}
                   <div className="flex gap-2">
                     <input
                       type="url"
@@ -784,8 +745,8 @@ export default function ScoutPage() {
                     </h3>
                     <p className="text-white/40 text-sm mb-2 max-w-xs">
                       {opportunityScraping
-                        ? "TinyFish is scraping each source for your goal. This may take several minutes."
-                        : `${opportunitySources.length} sources configured. Enter a goal and scan.`}
+                        ? "AI is refining your query, discovering sources, and scraping. This may take several minutes."
+                        : "Enter a goal — AI will refine it, find the best sources, and scrape them."}
                     </p>
                     {opportunityScraping && (
                       <div className="flex items-center justify-center gap-2 text-emerald-300 text-sm font-mono mt-2">
@@ -810,7 +771,7 @@ export default function ScoutPage() {
                   >
                     {opportunityScraping
                       ? `Hunting… ${formatElapsed(oppScrapeElapsed)}`
-                      : `Start Opportunity Hunt (${opportunitySources.length} sources)`}
+                      : 'Start Opportunity Hunt'}
                   </button>
 
                   {opportunityError && <p className="text-red-400 text-xs mt-3 text-center" data-testid="opportunity-error">{opportunityError}</p>}
